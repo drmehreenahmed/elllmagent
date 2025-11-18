@@ -1,7 +1,4 @@
-# el_agent_app.py -- Full integrated Streamlit app
-# Classification + High-only RF Regression + LLM analysis
-# Original classification features fully preserved
-
+# el_agent_app.py -- Optimized version using online models
 import streamlit as st
 import torch
 import tempfile
@@ -14,19 +11,27 @@ import numpy as np
 from PIL import Image
 import cv2
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import torchvision.models as models
+import torch.nn as nn
+from torchvision import transforms
 
 # ------------------------- CONFIG -------------------------
-MODEL_DIR = "models/deepseek-llm-7b-chat"
-FEATURE_MODEL_PATH = "models/resnet18_feature_extractor.pth"
+# Using Hugging Face model IDs instead of local paths
+DEEPSEEK_MODEL_ID = "deepseek-ai/deepseek-llm-7b-chat"
+# For smaller/faster alternative: "Qwen/Qwen-1_8B-Chat"
+
+# Only keep the small classifier files that you need to upload
 CLASSIFIER_PATH = "models/best_classifier_v2.pkl"
 RF_MODEL_PATH = "models/weighted_random_forest_model.pkl"
 SCALER_PATH = "models/feature_scaler.pkl"
+
 IMAGE_DISPLAY_WIDTH = 360
 AUTO_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_TOKENS_DEFAULT = 250
 TEMPERATURE_DEFAULT = 0.2
 
 st.set_page_config(page_title="🔍 EL LLM Agent", layout="wide")
+
 
 # Add custom CSS for styling
 st.markdown("""
@@ -131,40 +136,129 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # ------------------------- MODEL LOADERS -------------------------
 @st.cache_resource(show_spinner=True)
-def load_deepseek_model(model_dir=MODEL_DIR):
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
-    tmpdir = tempfile.mkdtemp(prefix="ds_offload_")
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            device_map="auto",
-            offload_folder=tmpdir,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-        )
-        device = next(model.parameters()).device
-        return tokenizer, model, device, tmpdir
-    except Exception as e:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        model = AutoModelForCausalLM.from_pretrained(model_dir)
-        model.to("cpu")
-        return tokenizer, model, torch.device("cpu"), None
+def load_deepseek_model():
+    """Load DeepSeek from Hugging Face Hub"""
+    with st.spinner("🔄 Loading DeepSeek-7B from Hugging Face Hub..."):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                DEEPSEEK_MODEL_ID, 
+                use_fast=True,
+                trust_remote_code=True
+            )
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                DEEPSEEK_MODEL_ID,
+                device_map="auto",
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True
+            )
+            
+            device = next(model.parameters()).device
+            st.success(f"✅ DeepSeek loaded on {device}")
+            return tokenizer, model, device, None
+            
+        except Exception as e:
+            st.error(f"❌ Failed to load DeepSeek: {str(e)}")
+            # Fallback to smaller model
+            try:
+                st.info("🔄 Trying smaller model Qwen-1.8B...")
+                tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen-1_8B-Chat")
+                model = AutoModelForCausalLM.from_pretrained(
+                    "Qwen/Qwen-1_8B-Chat",
+                    device_map="auto",
+                    torch_dtype=torch.float16
+                )
+                device = next(model.parameters()).device
+                return tokenizer, model, device, None
+            except Exception as e2:
+                st.error(f"❌ All LLM loading failed: {e2}")
+                return None, None, torch.device("cpu"), None
+
+@st.cache_resource(show_spinner=True)
+def load_resnet_feature_extractor():
+    """Load pre-trained ResNet from torchvision"""
+    with st.spinner("🔄 Loading ResNet feature extractor..."):
+        try:
+            # Load pre-trained ResNet18
+            model = models.resnet18(weights='IMAGENET1K_V1')
+            
+            # Remove the final classification layer to use as feature extractor
+            feature_extractor = nn.Sequential(*list(model.children())[:-1])
+            
+            # Set to eval mode
+            feature_extractor.eval()
+            
+            # Move to appropriate device
+            if torch.cuda.is_available():
+                feature_extractor = feature_extractor.cuda()
+            else:
+                feature_extractor = feature_extractor.cpu()
+                
+            st.success("✅ ResNet feature extractor loaded")
+            return feature_extractor
+            
+        except Exception as e:
+            st.error(f"❌ Failed to load ResNet: {str(e)}")
+            return None
 
 @st.cache_resource(show_spinner=True)
 def load_regression_components(rf_path=RF_MODEL_PATH, scaler_path=SCALER_PATH):
-    reg_model = joblib.load(rf_path)
-    scaler = joblib.load(scaler_path)
-    return reg_model, scaler
+    """Load only the small custom models that you need to upload"""
+    try:
+        reg_model = joblib.load(rf_path)
+        scaler = joblib.load(scaler_path)
+        return reg_model, scaler
+    except Exception as e:
+        st.error(f"Failed to load regression models: {str(e)}")
+        return None, None
 
 @st.cache_resource(show_spinner=True)
 def load_pce_classifier():
+    """Load your custom classifier (only this small file needs uploading)"""
     try:
+        # You'll need to modify your PCEClassifier to use the online ResNet
         from predictor import PCEClassifier
-        return PCEClassifier(FEATURE_MODEL_PATH, CLASSIFIER_PATH)
-    except Exception:
+        classifier = PCEClassifier(None, CLASSIFIER_PATH)  # Pass None for resnet path
+        
+        # Set the feature extractor to our online ResNet
+        classifier.feature_extractor = resnet_model
+        
+        return classifier
+    except Exception as e:
+        st.error(f"Failed to load PCE classifier: {str(e)}")
         return None
+
+# ------------------------- MODIFIED FEATURE EXTRACTION -------------------------
+def extract_resnet_features(pil_image):
+    """Extract features using the online ResNet model"""
+    if resnet_model is None:
+        return get_fast_features(np.array(pil_image.convert("L")))
+    
+    # Image preprocessing for ResNet
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    image_tensor = preprocess(pil_image).unsqueeze(0)
+    
+    if torch.cuda.is_available():
+        image_tensor = image_tensor.cuda()
+    
+    with torch.no_grad():
+        features = resnet_model(image_tensor)
+    
+    # Flatten the features
+    return features.squeeze().cpu().numpy()
+
+# You'll need to modify your PCEClassifier to use extract_resnet_features
+# instead of loading a local ResNet model
 
 # ------------------------- HELPER FUNCTIONS -------------------------
 def parse_classifier_result(raw):
@@ -249,20 +343,24 @@ def generate_llm_response(system_prompt, user_prompt, max_new_tokens, temperatur
         return llm_generate_local(tokenizer, deepseek, llm_device, system_prompt, user_prompt, max_new_tokens=max_new_tokens, temperature=temperature)
     return "⚠️ No local LLM available."
 
-# ------------------------- SESSION STATE -------------------------
-if "chat_history" not in st.session_state: st.session_state.chat_history = []
-if "results" not in st.session_state: st.session_state.results = []
-if "last_upload_names" not in st.session_state: st.session_state.last_upload_names = []
-if "user_question_input" not in st.session_state: st.session_state.user_question_input = ""
-
-# ------------------------- MODEL LOAD -------------------------
+# ------------------------- MODEL INITIALIZATION -------------------------
+# Initialize models
 with st.sidebar:
     st.title("⚙️ Models & LLM")
-    with st.spinner("Loading models..."):
+    
+    with st.spinner("Loading models from online sources..."):
+        # Load models that don't require large file uploads
         tokenizer, deepseek, llm_device, offload_tmp = load_deepseek_model()
-        classifier = load_pce_classifier()
+        resnet_model = load_resnet_feature_extractor()
         reg_model, feature_scaler = load_regression_components()
-    st.success("✅ Models loaded")
+        classifier = load_pce_classifier()
+    
+    if deepseek is not None and resnet_model is not None:
+        st.success("✅ Online models loaded successfully!")
+    else:
+        st.error("❌ Some models failed to load")
+    
+    # [Keep the rest of your sidebar controls...]
     model_choice = st.selectbox("LLM source", options=("local","none"))
     max_tokens = st.slider("Max tokens",64,1024,value=MAX_TOKENS_DEFAULT,step=16)
     temp = st.slider("Temperature",0.0,1.0,value=TEMPERATURE_DEFAULT,step=0.05)
