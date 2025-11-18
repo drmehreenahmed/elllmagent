@@ -1,37 +1,10 @@
-# Core dependencies
 streamlit==1.51.0
-
-# PyTorch with CPU-only versions for compatibility
-torch==2.6.0+cpu
-torchvision==0.21.0+cpu
-torchaudio==2.6.0+cpu
-
-# Transformers with compatible tokenizers
+torch==2.6.0
+torchvision==0.21.0
 transformers==4.41.0
-tokenizers>=0.20.0  # Updated for Python 3.13 compatibility
-
-# ML & Data Science
+tokenizers==0.20.0
 scikit-learn==1.7.2
 pandas==2.3.3
 numpy==2.1.2
-scipy==1.15.3
-joblib==1.5.2
-
-# Image processing
 pillow==11.3.0
-opencv-python==4.12.0.88
-
-# Hugging Face & utilities
-huggingface-hub==0.36.0
-accelerate==1.11.0
-safetensors==0.6.2
-protobuf==6.33.0
-
-# Web & utilities
-requests==2.32.5
-tqdm==4.67.1
-regex==2025.11.3
-
-# Optional visualization
-matplotlib==3.10.7
-seaborn==0.13.2
+joblib==1.5.2
